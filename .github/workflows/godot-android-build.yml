@@ -1,0 +1,184 @@
+name: Godot Android Build
+
+on:
+  workflow_dispatch:
+    inputs:
+      job_id:
+        description: Build job id
+        required: true
+        type: string
+      zip_path:
+        description: Path ZIP project di repo
+        required: true
+        type: string
+      godot_version:
+        description: Godot version, contoh 4.2.2
+        required: true
+        default: 4.2.2
+        type: string
+      godot_status:
+        description: stable / beta / rc
+        required: true
+        default: stable
+        type: string
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  build-android:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set variables
+        id: vars
+        shell: bash
+        run: |
+          set -e
+          VERSION="${{ inputs.godot_version }}"
+          STATUS="${{ inputs.godot_status }}"
+          TEMPLATE_ID="${VERSION}.${STATUS}"
+          RELEASE_TAG="${VERSION}-${STATUS}"
+          GODOT_ZIP="Godot_v${VERSION}-${STATUS}_linux.x86_64.zip"
+          GODOT_BIN="Godot_v${VERSION}-${STATUS}_linux.x86_64"
+          TEMPLATES_ZIP="Godot_v${VERSION}-${STATUS}_export_templates.tpz"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "status=$STATUS" >> "$GITHUB_OUTPUT"
+          echo "template_id=$TEMPLATE_ID" >> "$GITHUB_OUTPUT"
+          echo "release_tag=$RELEASE_TAG" >> "$GITHUB_OUTPUT"
+          echo "godot_zip=$GODOT_ZIP" >> "$GITHUB_OUTPUT"
+          echo "godot_bin=$GODOT_BIN" >> "$GITHUB_OUTPUT"
+          echo "templates_zip=$TEMPLATES_ZIP" >> "$GITHUB_OUTPUT"
+
+      - name: Install dependencies
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y unzip wget openjdk-17-jdk libfontconfig1 libxrender1 libxext6 libxi6 libxrandr2 libxcursor1 libxinerama1 libgl1
+          echo "JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64" >> "$GITHUB_ENV"
+
+      - name: Install Android SDK tools
+        shell: bash
+        run: |
+          set -e
+          yes | sdkmanager --licenses >/dev/null || true
+          sdkmanager "platform-tools" "platforms;android-35" "build-tools;35.0.0" "cmdline-tools;latest"
+
+      - name: Download Godot and export templates
+        shell: bash
+        run: |
+          set -e
+          BASE="https://github.com/godotengine/godot/releases/download/${{ steps.vars.outputs.release_tag }}"
+          wget -q "$BASE/${{ steps.vars.outputs.godot_zip }}" -O godot.zip
+          unzip -q godot.zip -d godot-bin
+          chmod +x "godot-bin/${{ steps.vars.outputs.godot_bin }}"
+          wget -q "$BASE/${{ steps.vars.outputs.templates_zip }}" -O templates.tpz
+          mkdir -p "$HOME/.local/share/godot/export_templates/${{ steps.vars.outputs.template_id }}"
+          unzip -q templates.tpz -d templates-unpacked
+          cp -r templates-unpacked/templates/* "$HOME/.local/share/godot/export_templates/${{ steps.vars.outputs.template_id }}/"
+
+      - name: Prepare editor settings for Android export
+        shell: bash
+        run: |
+          set -e
+          mkdir -p "$HOME/.config/godot"
+          printf '%s\n' \
+            '[gd_resource type="EditorSettings" format=3]' \
+            '' \
+            '[resource]' \
+            'export/android/android_sdk_path = "/usr/local/lib/android/sdk"' \
+            'export/android/java_sdk_path = "/usr/lib/jvm/java-17-openjdk-amd64"' \
+            'export/android/debug_keystore = "/home/runner/.android/debug.keystore"' \
+            > "$HOME/.config/godot/editor_settings-4.tres"
+          mkdir -p "$HOME/.android"
+          if [ ! -f "$HOME/.android/debug.keystore" ]; then
+            keytool -genkeypair -v -keystore "$HOME/.android/debug.keystore" -storepass android -alias androiddebugkey -keypass android -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=Android Debug,O=Android,C=US"
+          fi
+
+      - name: Extract project ZIP
+        shell: bash
+        run: |
+          set -e
+          mkdir -p work/project
+          unzip -q "${{ inputs.zip_path }}" -d work/raw
+          PROJECT_DIR=""
+          FOUND=$(find work/raw -name project.godot -type f | head -n 1 || true)
+          if [ -z "$FOUND" ]; then
+            echo "project.godot tidak ditemukan di dalam ZIP" >&2
+            exit 1
+          fi
+          PROJECT_DIR=$(dirname "$FOUND")
+          echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
+          echo "Project dir: $PROJECT_DIR"
+
+      - name: Create Android export preset if missing
+        shell: bash
+        run: |
+          set -e
+          cd "$PROJECT_DIR"
+          if [ ! -f export_presets.cfg ]; then
+            printf '%s\n' \
+              '[preset.0]' \
+              '' \
+              'name="Android"' \
+              'platform="Android"' \
+              'runnable=true' \
+              'dedicated_server=false' \
+              'custom_features=""' \
+              'export_filter="all_resources"' \
+              'include_filter=""' \
+              'exclude_filter=""' \
+              'export_path="../output/app-release.apk"' \
+              'encryption_include_filters=""' \
+              'encryption_exclude_filters=""' \
+              'encrypt_pck=false' \
+              'encrypt_directory=false' \
+              'script_export_mode=2' \
+              '' \
+              '[preset.0.options]' \
+              '' \
+              'gradle_build/use_gradle_build=false' \
+              'gradle_build/export_format=0' \
+              'custom_template/debug=""' \
+              'custom_template/release=""' \
+              'architectures/armeabi-v7a=true' \
+              'architectures/arm64-v8a=true' \
+              'version/code=1' \
+              'version/name="1.0"' \
+              'package/unique_name="org.godotengine.generated.${{ inputs.job_id }}"' \
+              'package/name="Godot APK"' \
+              'package/signed=true' \
+              'package/app_category=2' \
+              'keystore/debug="/home/runner/.android/debug.keystore"' \
+              'keystore/debug_user="androiddebugkey"' \
+              'keystore/debug_password="android"' \
+              'keystore/release="/home/runner/.android/debug.keystore"' \
+              'keystore/release_user="androiddebugkey"' \
+              'keystore/release_password="android"' \
+              'launcher_icons/main_192x192=""' \
+              'launcher_icons/adaptive_foreground_432x432=""' \
+              'launcher_icons/adaptive_background_432x432=""' \
+              > export_presets.cfg
+          fi
+          mkdir -p ../output
+
+      - name: Build APK
+        shell: bash
+        run: |
+          set -e
+          cd "$PROJECT_DIR"
+          ../../godot-bin/${{ steps.vars.outputs.godot_bin }} --headless --verbose --export-release Android ../output/app-release.apk
+          ls -lah ../output
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: apk-${{ inputs.job_id }}
+          path: work/output/*.apk
+          if-no-files-found: error
+          retention-days: 1
